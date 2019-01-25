@@ -19,9 +19,6 @@ def run_command(command,allowed_return_codes=[0]):
   sys.exit(1)
 def get_nvme_devices():
  return list(map(lambda p:'/dev/{}'.format(p),filter(lambda p:re.match(r'^nvme[0-9]+n1$',p),os.listdir('/dev/'))))
-def get_all_mounts_on(real_device):
- _,mounts=run_command(['mount'])
- return sorted([m.group('mount_point')for m in re.finditer('^'+real_device+r'\s+on\s(?P<mount_point>[^\s]+).*$',mounts,re.MULTILINE)])
 def get_nvme_block_device_mappings():
  return{'/dev/{}'.format(run_command(['ebsnvme-id','--udev',dev])[1].strip()):dev for dev in get_nvme_devices()}
 def get_real_device(device):
@@ -45,62 +42,29 @@ def conditional_format_device(entry,label):
  else:
   logging.info('%s  is already formatted',entry.device)
 MountEntry=collections.namedtuple('MountEntry','device, mount_point, fstype, options, dump, fsck_pass')
-def __find_mount_point(mount_point,entries):
- for i,entry in enumerate(entries):
-  if not entry.startswith('#'):
-   fields=entry.split()
-   print(mount_point,fields[1])
-   if len(fields)>=4 and fields[0]==mount_point:
-    print('\o/',mount_point,fields[1])
-    return i,fields
- return-1,[]
-def __remove_mount_points(entries,entry):
- matches=list(reversed(filter(lambda i:entries[i].device==entry.device or entries[i].mount_point==entry.mount_point,range(len(entries)))))
- for i in matches:
-  logging.info('removing fstab entry for %s on %s',entries[i].device,entries[i].mount_point)
-  entries.pop(i)
- return matches
-def update_fstab(entry):
- entries=read_fstab()
- __remove_mount_points(entries,entry)
- logging.info('adding fstab entry for %s to %s',entry.device,entry.mount_point)
- entries.append(entry)
- write_fstab(entries)
-def read_fstab():
+def read_mounts(path='/proc/mounts'):
  fspattern=re.compile(r'^(?P<device>[^\s]+)\s+(?P<mount_point>[^\s]+)\s+(?P<fstype>[^\s]+)\s+(?P<options>[^\s]+)\s*(?P<dump>[^\s]+)?\s*(?P<fsck_pass>[^\s]+)?\s*$',re.MULTILINE)
- with open('/etc/fstab','r')as f:
+ with open(path,'r')as f:
   return list(map(lambda l:MountEntry(**l.groupdict()),fspattern.finditer(f.read())))
-def write_fstab(entries):
- logging.info('rewriting /etc/fstab')
- with open('/etc/fstab','w')as f:
-  for entry in entries:
-   f.write('{device}\t{mount_point}\t{fstype}\t{options}'.format(**entry._asdict()))
-   if entry.dump is not None:
-    f.write('\t{dump}'.format(**entry._asdict()))
-    if entry.fsck_pass is not None:
-     f.write('\t{fsck_pass}'.format(**entry._asdict()))
-   f.write('\n')
-def unmount(mount_point):
- return_code,_=run_command(['mountpoint','-q',mount_point],[0,1])
- if return_code==0:
-  logging.info('unmounting %s',mount_point)
-  run_command(['umount',mount_point])
-def remount(entry):
- unmount(entry.mount_point)
- for mp in get_all_mounts_on(entry.device):
-  unmount(mp)
- if not os.path.exists(entry.mount_point):
-  logging.info('creating mount point %s',entry.mount_point)
-  run_command(['mkdir','-p',entry.mount_point])
- logging.info('mounting %s',entry.mount_point)
- run_command(["mount",entry.mount_point])
-def mount_ebs_volume(entry,label,do_mount):
+def mount(entry):
+ mounts=read_mounts('/proc/mounts')
+ mounted=filter(lambda m:m.device==entry.device and m.mount_point==entry.mount_point,mounts)
+ if not mounted:
+  if filter(lambda m:m.mount_point==entry.mount_point,mounts):
+   logging.error('mount point %s is already in use',entry.mount_point)
+   sys.exit(1)
+  if not os.path.exists(entry.mount_point):
+   logging.info('creating mount point %s',entry.mount_point)
+   run_command(['mkdir','-p',entry.mount_point])
+  logging.info('mounting %s',entry.mount_point)
+  run_command(["mount",'-t',entry.fstype,'-o',entry.options,entry.device,entry.mount_point])
+ else:
+  logging.info('device %s already mounted on %s',entry.device,entry.mount_point)
+def mount_ebs_volume(entry,label):
  wait_for_device(entry.device)
  entry=MountEntry(get_real_device(entry.device),entry.mount_point,entry.fstype,entry.options,entry.dump,entry.fsck_pass)
  conditional_format_device(entry,label)
- update_fstab(entry)
- if do_mount:
-  remount(entry)
+ mount(entry)
 if __name__=='__main__':
  logging.basicConfig(format='%(levelname)s: %(message)s',level='INFO')
  if os.path.exists('/dev/log'):
@@ -110,12 +74,9 @@ if __name__=='__main__':
  parser.add_argument('--directory',dest='directory',required=True,help='to mount onto')
  parser.add_argument('--fstype',dest='fstype',required=True,help='of the device')
  parser.add_argument('--options',dest='options',required=True,help='used in the mount')
- parser.add_argument('--dump',dest='dump',help='used in the mount')
- parser.add_argument('--pass',dest='fsck_pass',help='used in the mount')
- parser.add_argument('--label',dest='label',help='to apply to the fs, when formatting')
- parser.add_argument('--do-not-mount',dest='mount',default=True,action='store_false',help='the device')
+ parser.add_argument('--label',dest='label',help='to assign to the disk')
  args=parser.parse_args()
- entry=MountEntry(args.device,args.directory,args.fstype,args.options,args.dump,args.fsck_pass)
- mount_ebs_volume(entry,args.label if args.label else args.device,args.mount)
+ entry=MountEntry(args.device,args.directory,args.fstype,args.options,0,0)
+ mount_ebs_volume(entry,args.label if args.label else args.device)
 # Created by pyminifier (https://github.com/liftoff/pyminifier)
 
