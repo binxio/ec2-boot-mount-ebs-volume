@@ -166,7 +166,7 @@ if __name__ == '__main__':
     if os.path.exists('/dev/log'):
         logging.getLogger().addHandler(logging.handlers.SysLogHandler(address='/dev/log'))
 
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description='mount an EBS Volume on boot', formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--device', dest='device', required=True, help='to mount')
     parser.add_argument('--directory', dest='directory', required=True, help='to mount onto')
     parser.add_argument('--fstype', dest='fstype', required=True, help='of the device')
