@@ -1,6 +1,6 @@
-Mounts an EBS Volume and updates /etc/fstab on ec2 instance boot
-================================================================
-This utility is intended to be used in the boot commands of an EC2 instance. It will:
+Mounts an EBS Volume on ec2 instance boot
+=========================================
+This utility is intended to be used in the boot phase of an EC2 instance. It will:
 
 - wait for the EBS volume to be attached
 - format the volume, if unformatted
