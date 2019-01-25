@@ -1,0 +1,247 @@
+#!/usr/bin/env python
+#
+# Copyright 2019 - binx.io B.V.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+"""Mounts an EBS Volume and updates /etc/fstab
+
+This utility is intended to be used in the boot command of
+an EC2 instance. It will:
+
+- wait for the EBS volume to be attached
+- format the volume, if unformatted
+- add/update an entry in /etc/fstab
+- unmount & remove /etc/fstab entries mounted on the same device
+- unmount & remove /etc/fstab entries with the same mountpoint
+- mount the device
+
+With the introduction of the Nitro-based instance types, the device name
+specified in the attach volume command is ignored. The volume will be 
+assigned a device name which matches the pattern /dev/nvme[0-9]+n1, where
+the number is associated with the order in which the volumes was mounted.
+
+On Nitro-based instance types, the volume will be queried for the
+assigned device name using ebsnvme-id. This will ensure that 
+the mount command is the same and independent of the machine type and
+and order of volume attachement.
+
+"""
+import os
+import sys
+import time
+import re
+import logging
+import subprocess
+import argparse
+import collections
+
+
+def run_command(command, allowed_return_codes=[0]):
+    """
+    runs subprocess.checkout returning return code and output, if the return code is in `allowed_return_codes`.
+    If not, an error is logged and sys.exit(1) is called.
+    """
+    try:
+        result = subprocess.check_output(command)
+        return 0, result
+    except subprocess.CalledProcessError as e:
+        if e.returncode not in allowed_return_codes:
+            logging.error('%s', ' '.join(command))
+            sys.exit(1)
+        return e.returncode, e.output
+
+
+def get_nvme_devices():
+    """
+    returns all NVMe devices in /dev
+    """
+    return list(map(lambda p: '/dev/{}'.format(p), filter(lambda p: re.match(r'^nvme[0-9]+n1$', p), os.listdir('/dev/'))))
+
+
+def get_all_mounts_on(real_device):
+    """
+    returns all mounts points on the specified device
+    """
+    _, mounts = run_command(['mount'])
+    return sorted([m.group('mount_point') for m in re.finditer('^' + real_device + r'\s+on\s(?P<mount_point>[^\s]+).*$', mounts, re.MULTILINE)])
+
+
+def get_nvme_block_device_mappings():
+    """
+    returns a dictionary of block device mapping names to nvme device name
+    """
+    return {'/dev/{}'.format(run_command(['ebsnvme-id', '--udev', dev])[1].strip()): dev for dev in get_nvme_devices()}
+
+
+def get_real_device(device):
+    """
+    returns the real device name. On NVMe instances, it will lookup the device name mapping name on the devices using ebsnvme-id.
+    """
+    return device if os.path.exists(device) and not os.path.islink(device) else get_nvme_block_device_mappings().get(device)
+
+
+def wait_for_device(device):
+    """
+    wait indefinitely for the device to appear as EBS volumes may be attached after the EC2 instance is booted.
+    """
+    real_device = get_real_device(device)
+    while not (real_device and os.path.exists(real_device)):
+        if real_device:
+            logging.info('waiting for %s (%s) to appear', real_device, device)
+        else:
+            logging.info('waiting for %s to appear', device)
+        time.sleep(5)
+
+
+def is_device_formatted(device):
+    """
+    True if the device is formatted, otherwise False.
+    """
+    return_code, _ = run_command(["blkid", real_device], [0, 2])
+    return return_code == 0
+
+
+def conditional_format_device(entry, label):
+    """
+    formats the device if it is not already formatted.
+    """
+    if not is_device_formatted(entry.device):
+        logging.info('formatting %s', real_device)
+
+        _, output = run_command(['mkfs', '-L', label, '-t', fstype, entry.device])
+        logging.info('%s', output)
+    else:
+        logging.info('%s  is already formatted', entry.device)
+
+
+MountEntry = collections.namedtuple('MountEntry', 'device, mount_point, fstype, options, dump, fsck_pass')
+
+
+def __find_mount_point(mount_point, entries):
+    """
+    find the entry for the specified mountpoint in the array of entries. Returns an offset, fields pair.
+    If not found, an offset of -1 is returned.
+    """
+    for i, entry in enumerate(entries):
+        if not entry.startswith('#'):
+            fields = entry.split()
+            print(mount_point, fields[1])
+            if len(fields) >= 4 and fields[0] == mount_point:
+                print('\o/', mount_point, fields[1])
+                return i, fields
+    return -1, []
+
+
+def __remove_mount_points(entries, entry):
+    """
+    remove all mount points entries on the same device or mount point as `entry`.
+    """
+    matches = list(reversed(filter(lambda i: entries[i].device ==
+                                   entry.device or entries[i].mount_point == entry.mount_point, range(len(entries)))))
+    for i in matches:
+        logging.info('removing fstab entry for %s on %s', entries[i].device, entries[i].mount_point)
+        entries.pop(i)
+    return matches
+
+
+def update_fstab(entry):
+    """
+    updates the fstab entries with new_entry. An existing entry for new_entry.mount_point is replaced.
+    Other mounts on the new_entry.device are removed.
+    """
+    entries = read_fstab()
+    __remove_mount_points(entries, entry)
+    logging.info('adding fstab entry for %s to %s', entry.device, entry.mount_point)
+    entries.append(entry)
+    write_fstab(entries)
+
+
+def read_fstab():
+    """
+    read /etc/fstab into a list of MountEntry
+    """
+    fspattern = re.compile(
+        r'^(?P<device>[^\s]+)\s+(?P<mount_point>[^\s]+)\s+(?P<fstype>[^\s]+)\s+(?P<options>[^\s]+)\s*(?P<dump>[^\s]+)?\s*(?P<fsck_pass>[^\s]+)?\s*$', re.MULTILINE)
+    with open('/etc/fstab', 'r') as f:
+        return list(map(lambda l: MountEntry(**l.groupdict()), fspattern.finditer(f.read())))
+
+
+def write_fstab(entries):
+    """
+    write a list of MountEntry into /etc/fstab
+    """
+    fspattern = re.compile(
+    logging.info('rewriting /etc/fstab')
+    with open('/etc/fstab', 'w') as f:
+        for entry in entries:
+            f.write('{device}\t{mount_point}\t{fstype}\t{options}'.format(**entry._asdict()))
+            if entry.dump is not None:
+                f.write('\t{dump}'.format(**entry._asdict()))
+                if entry.fsck_pass is not None:
+                    f.write('\t{fsck_pass}'.format(**entry._asdict()))
+            f.write('\n')
+
+
+def unmount(mount_point):
+    """
+    umount the directory
+    """
+    return_code, _ = run_command(['mountpoint', '-q', mount_point], [0, 1])
+    if return_code == 0:
+        logging.info('unmounting %s', mount_point)
+        run_command(['umount', mount_point])
+
+
+def remount(entry):
+    """
+    mounts the directory, unmounting the previous one.
+    """
+    unmount(entry.mount_point)
+    for mp in get_all_mounts_on(entry.device):
+        unmount(mp)
+    if not os.path.exists(entry.mount_point):
+        logging.info('creating mount point %s', entry.mount_point)
+        run_command(['mkdir', '-p', entry.mount_point])
+    logging.info('mounting %s', entry.mount_point)
+    run_command(["mount", entry.mount_point])
+
+
+def mount_ebs_volume(entry, label, do_mount):
+    """
+    waits for an EBS volume to appear as `device`, formats and labels it if unformatted,
+    mounts the device while updating the /etc/fstab.
+    """
+    wait_for_device(entry.device)
+    entry = MountEntry(get_real_device(entry.device), entry.mount_point, entry.fstype, entry.options, entry.dump, entry.fsck_pass)
+    conditional_format_device(entry, label)
+    update_fstab(entry)
+    if do_mount:
+        remount(entry)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(format='%(levelname)s: %(message)s', level='INFO')
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--device', dest='device', required=True, help='to mount')
+    parser.add_argument('--directory', dest='directory', required=True, help='to mount onto')
+    parser.add_argument('--fstype', dest='fstype', required=True, help='of the device')
+    parser.add_argument('--options', dest='options', required=True, help='used in the mount')
+    parser.add_argument('--dump', dest='dump', help='used in the mount')
+    parser.add_argument('--pass', dest='fsck_pass', help='used in the mount')
+    parser.add_argument('--label', dest='label', help='to apply to the fs, when formatting')
+    parser.add_argument('--do-not-mount', dest='mount', default=True, action='store_false', help='the device')
+
+    args = parser.parse_args()
+    entry = MountEntry(args.device, args.directory, args.fstype, args.options, args.dump, args.fsck_pass)
+    mount_ebs_volume(entry, args.label if args.label else args.device, args.mount)
