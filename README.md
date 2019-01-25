@@ -1,7 +1,6 @@
-Mounts an EBS Volume and updates /etc/fstab
-
-This utility is intended to be used in the boot commands of
-an EC2 instance. It will:
+Mounts an EBS Volume and updates /etc/fstab on ec2 instance boot
+================================================================
+This utility is intended to be used in the boot commands of an EC2 instance. It will:
 
 - wait for the EBS volume to be attached
 - format the volume, if unformatted
@@ -21,3 +20,10 @@ assigned device name using ebsnvme-id. This will ensure that
 the mount command is the same and independent of the machine type and
 and order of volume attachment.
 
+## Usage
+In your cloud-init and the following bootcmd:
+```
+ - ec2-boot-mount-ebs-volume --device /dev/xvdd --directory /var/mysql --fstype ext4 --options defaults || shutdown now
+```
+note that we shutdown the instance, if an error occurs. Typically volumes are attached, with precious data. Allowing
+the machine to continue to boot, while the disk is not mounted would be dangerous.
