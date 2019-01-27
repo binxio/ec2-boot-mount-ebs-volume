@@ -50,7 +50,7 @@ Resources:
             - mkdir -p /var/mqm
             - while [ ! -b $(readlink -f /dev/xvdd) ]; do echo "waiting for device /dev/xvdd"; sleep 5 ; done
             - blkid $(readlink -f /dev/xvdd) || mkfs -t ext4 $(readlink -f /dev/xvdd)
-            - e2label $(readlink -f /dev/xvdd) wqm-data
+            - e2label $(readlink -f /dev/xvdd) wmq-data
             - grep -q ^LABEL=wmq-data /etc/fstab || echo 'LABEL=wmq-data /var/mqm ext4 defaults' >> /etc/fstab
             - grep -q "^$(readlink -f /dev/xvdd) /var/mqm " /proc/mounts || mount /var/mqm
 
