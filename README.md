@@ -1,11 +1,12 @@
 Mounts an EBS Volume on ec2 instance boot
 =========================================
-This utility is intended to be used in the boot phase of an EC2 instance. It will:
+This utility is intended to be used in the boot phase of an EC2 instance. It will 
+generate a boot command sequence, which:
 
-- wait for the EBS volume to be attached
-- format and labels the volume, if unformatted
+- waits for the EBS volume to be attached
+- formats and labels the volume, if unformatted
 - adds an /etc/fstab mount entry using LABEL=
-- mounts the device
+- mounts the device if not mounted.
 
 The utility will also on Nitro-based instance types, where
 the device name specified in the attach volume command is ignored. The 
@@ -37,3 +38,5 @@ It will generate a bootcmd snippet, you can add to your user-data.
     - grep -q ^LABEL=wmq-data /etc/fstab || echo 'LABEL=wmq-data /var/mqm ext4 defaults' >> /etc/fstab
     - grep -q "^$(readlink -f /dev/xvdd) /var/mqm " /proc/mounts || mount /var/mqm
 ```
+
+It has to be hard-coded, as the write-files module of cloud-init is run after the bootcmd.
