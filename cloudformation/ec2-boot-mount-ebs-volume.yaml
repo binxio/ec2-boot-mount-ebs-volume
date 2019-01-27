@@ -1,0 +1,93 @@
+#
+# Copyright 2019 - binx.io B.V.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  SecurityGroups:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+  AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2'
+  InstanceType:
+    Type: String
+    Default: t3.nano
+
+Resources:
+  Instance01:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [ 0, !Ref Subnets ]
+      SecurityGroupIds: !Ref SecurityGroups
+      Volumes:
+        - Device: /dev/xvdd
+          VolumeId: !Ref Storage01
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceType}-01'
+      IamInstanceProfile: !Ref IamInstanceProfile
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          bootcmd:
+            - mkdir -p /var/mqm
+            - while [ ! -b $(readlink -f /dev/xvdd) ]; do echo "waiting for device /dev/xvdd"; sleep 5 ; done
+            - blkid $(readlink -f /dev/xvdd) || mkfs -t ext4 $(readlink -f /dev/xvdd)
+            - e2label $(readlink -f /dev/xvdd) wqm-data
+            - grep -q ^LABEL=wmq-data /etc/fstab || echo 'LABEL=wmq-data /var/mqm ext4 defaults' >> /etc/fstab
+            - grep -q "^$(readlink -f /dev/xvdd) /var/mqm " /proc/mounts || mount /var/mqm
+
+  IamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref 'InstanceRole'
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+
+  InstanceVolume01:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/xvdd
+      InstanceId: !Ref Instance01
+      VolumeId: !Ref Storage01
+
+  Storage01:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: '10'
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      Tags:
+        - Key: Name
+          Value: storage01

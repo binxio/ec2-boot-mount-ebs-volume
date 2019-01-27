@@ -22,9 +22,18 @@ As the device name now potentially fluctuates on every boot,
 the use of hard coded nvme device names is hazarduous.
 
 ## Usage
-In your cloud-init and the following bootcmd:
+To generate the required boot commands, type:
 ```
- - ec2-boot-mount-ebs-volume /dev/xvdd /var/mysql ext4 defaults || shutdown now
+$ ./generate-mount-ebs-volume-bootcmd /dev/xvdd /var/mqm wmq-data
 ```
-this shuts down the instance, if an error occurs. Typically volumes are attached, with precious 
-data. Allowing the machine to continue to boot, while the disk is not mounted would be dangerous.
+The first parameter is your device name, the second the mount point and the third the label.
+It will generate a bootcmd snippet, you can add to your user-data.
+```
+  bootcmd:
+    - mkdir -p /var/mqm
+    - while [ ! -b $(readlink -f /dev/xvdd) ]; do echo "waiting for device /dev/xvdd"; sleep 5 ; done
+    - blkid $(readlink -f /dev/xvdd) || mkfs -t ext4 $(readlink -f /dev/xvdd)
+    - e2label $(readlink -f /dev/xvdd) wmq-data
+    - grep -q ^LABEL=wmq-data /etc/fstab || echo 'LABEL=wmq-data /var/mqm ext4 defaults' >> /etc/fstab
+    - grep -q "^$(readlink -f /dev/xvdd) /var/mqm " /proc/mounts || mount /var/mqm
+```
