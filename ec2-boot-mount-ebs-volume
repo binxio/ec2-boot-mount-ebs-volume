@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/bin/bash
 #
 # Copyright 2019 - binx.io B.V.
 #
@@ -14,165 +14,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Mounts an EBS Volume
-
-This utility is intended to be used in the boot command of
-an EC2 instance. It will:
-
-- wait for the EBS volume to be attached
-- format the volume, if unformatted
-- mounts the device
-
-With the introduction of the Nitro-based instance types, the device name
-specified in the attach volume command is ignored. The volume will be 
-assigned a device name which matches the pattern /dev/nvme[0-9]+n1, where
-the number is associated with the order in which the volumes was mounted.
-
-On Nitro-based instance types, the volume will be queried for the
-assigned device name using ebsnvme-id. This will ensure that 
-the mount command is the same and independent of the machine type and
-and order of volume attachement.
-
-"""
-import os
-import sys
-import time
-import re
-import logging
-import logging.handlers
-import subprocess
-import argparse
-import collections
+set -e -o pipefail 
+exec 1> >(logger -s -t $(basename $0)) 2>&1
 
 
-def run_command(command, allowed_return_codes=[0]):
-    """
-    runs subprocess.checkout returning return code and output, if the return code is in `allowed_return_codes`.
-    If not, an error is logged and sys.exit(1) is called.
-    """
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout, stderr = process.communicate()
-    if process.returncode in allowed_return_codes:
-        return process.returncode, stdout
-    else:
-        logging.error('%s failed', ' '.join(command))
-        logging.error('%s', stderr)
-        sys.exit(1)
+function wait_for_device {
+	while [[ ! -b $(readlink -f $1) ]]; do
+	    echo "waiting for device $1" >&2 
+	    sleep 5; 
+        done 
+}
 
+function label_device {
+	label=$(blkid $1 | sed -e 's/.*LABEL="\([^"]*\)".*/\1/')
+	if [[ -z $label ]]; then 
+		echo "INFO: labeling $1 with $2">&2
+		e2label $1 $2; 
+	elif [[ $label != $2 ]]; then
+		echo "ERROR: device $1 already has label $label, expected $2">&2; exit 1
+	fi
+}
 
-def get_nvme_devices():
-    """
-    returns all NVMe devices in /dev
-    """
-    return list(map(lambda p: '/dev/{}'.format(p), filter(lambda p: re.match(r'^nvme[0-9]+n1$', p), os.listdir('/dev/'))))
+function main {
+	local device mount_point fstype options
+	if [[ $# -ne 4 ]] ;then
+		echo "Usage: $(basename $0) device-name mount-point fstype options" >&2
+		echo "	waits for the volume, formats it if unformatted and mounts it." >&2
+		exit 1 
+	fi
+	device="$1" 
+	mount_point="$2"
+	fstype="$3"
+	options="$4"
 
+	wait_for_device $device
+        real_device=$(readlink -f $device)
+	if [[ $real_device != $device ]] ;then
+		echo "INFO: $device appeared as $real_device" >&2
+	fi
 
-def get_nvme_block_device_mappings():
-    """
-    returns a dictionary of block device mapping names to nvme device name
-    """
-    return {'/dev/{}'.format(run_command(['ebsnvme-id', '--udev', dev])[1].strip()): dev for dev in get_nvme_devices()}
+	if grep -q "^$real_device $mount_point " /proc/mounts; then
+		echo "INFO: $real_device already mounted on $mount_point" >&2
+		return 0
+	fi
 
+	if [[ -z $(blkid $real_device) ]] ; then
+		echo "INFO: formatting $real_device" >&2
+		mkfs -L $mount_point -t $fstype $real_device
+	else
+		echo "INFO: $real_device already formatted" >&2
+		label_device $real_device $mount_point
+	fi
 
-def get_real_device(device):
-    """
-    returns the real device name. On NVMe instances, it will lookup the device name mapping name on the devices using ebsnvme-id.
-    """
-    return device if os.path.exists(device) and not os.path.islink(device) else get_nvme_block_device_mappings().get(device)
+	if ! grep -q "^LABEL=$mount_point $mount_point" /etc/fstab; then
+		echo "INFO: adding entry to /etc/fstab" >&2
+		cp /etc/fstab /etc/fstab.org
+		awk -v mount_point=$mount_point '{if ($2 != mount_point) print $0}' /etc/fstab.org > /etc/fstab
+		echo "LABEL=$mount_point $mount_point $fstype $options" >> /etc/fstab
+	fi
 
+	echo "INFO: mounting $real_device on $mount_point" >&2
+	mkdir -p $mount_point
+	mount $mount_point
+}
 
-def wait_for_device(device):
-    """
-    wait indefinitely for the device to appear as EBS volumes may be attached after the EC2 instance is booted.
-    """
-    real_device = get_real_device(device)
-    while not (real_device and os.path.exists(real_device)):
-        if real_device:
-            logging.info('waiting for %s (%s) to appear', real_device, device)
-        else:
-            logging.info('waiting for %s to appear', device)
-        time.sleep(5)
-
-
-def is_device_formatted(device):
-    """
-    True if the device is formatted, otherwise False.
-    """
-    return_code, _ = run_command(["blkid", device], [0, 2])
-    return return_code == 0
-
-
-def conditional_format_device(entry, label):
-    """
-    formats the device if it is not already formatted.
-    """
-    if not is_device_formatted(entry.device):
-        logging.info('formatting %s', entry.device)
-
-        _, output = run_command(['mkfs', '-L', label, '-t', entry.fstype, entry.device])
-        logging.info('%s', output)
-    else:
-        logging.info('%s  is already formatted', entry.device)
-
-
-MountEntry = collections.namedtuple('MountEntry', 'device, mount_point, fstype, options, dump, fsck_pass')
-
-
-def read_mounts(path='/proc/mounts'):
-    """
-    read all mounts from `path`. Can be /proc/mounts or /etc/fstab.
-    """
-    fspattern = re.compile(
-        r'^(?P<device>[^\s]+)\s+(?P<mount_point>[^\s]+)\s+(?P<fstype>[^\s]+)\s+(?P<options>[^\s]+)\s*(?P<dump>[^\s]+)?\s*(?P<fsck_pass>[^\s]+)?\s*$',
-        re.MULTILINE)
-    with open(path, 'r') as f:
-        return list(map(lambda l: MountEntry(**l.groupdict()), fspattern.finditer(f.read())))
-
-
-def mount(entry):
-    """
-    mounts the directory, unmounting the previous one.
-    """
-    mounts = read_mounts('/proc/mounts')
-    mounted = filter(lambda m: m.device == entry.device and m.mount_point == entry.mount_point, mounts)
-    if not mounted:
-        if filter(lambda m: m.mount_point == entry.mount_point, mounts):
-            logging.error('mount point %s is already in use', entry.mount_point)
-            sys.exit(1)
-
-        if not os.path.exists(entry.mount_point):
-            logging.info('creating mount point %s', entry.mount_point)
-            run_command(['mkdir', '-p', entry.mount_point])
-
-        logging.info('mounting %s', entry.mount_point)
-        run_command(["mount", '-t', entry.fstype, '-o', entry.options, entry.device, entry.mount_point])
-    else:
-        logging.info('device %s already mounted on %s', entry.device, entry.mount_point)
-
-
-def mount_ebs_volume(entry, label):
-    """
-    waits for an EBS volume to appear as `device`, formats and labels it if unformatted,
-    mounts the device.
-    """
-    wait_for_device(entry.device)
-    entry = MountEntry(get_real_device(entry.device), entry.mount_point, entry.fstype, entry.options, entry.dump, entry.fsck_pass)
-    conditional_format_device(entry, label)
-    mount(entry)
-
-
-if __name__ == '__main__':
-    logging.basicConfig(format='%(levelname)s: %(message)s', level='INFO')
-    if os.path.exists('/dev/log'):
-        logging.getLogger().addHandler(logging.handlers.SysLogHandler(address='/dev/log'))
-
-    parser = argparse.ArgumentParser(description='mount an EBS Volume on boot', formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--device', dest='device', required=True, help='to mount')
-    parser.add_argument('--directory', dest='directory', required=True, help='to mount onto')
-    parser.add_argument('--fstype', dest='fstype', required=True, help='of the device')
-    parser.add_argument('--options', dest='options', required=True, help='used in the mount')
-    parser.add_argument('--label', dest='label', help='to assign to the disk')
-
-    args = parser.parse_args()
-    entry = MountEntry(args.device, args.directory, args.fstype, args.options, 0, 0)
-    mount_ebs_volume(entry, args.label if args.label else args.device)
+main "$@"
