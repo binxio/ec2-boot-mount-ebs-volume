@@ -28,7 +28,7 @@ To generate the required boot commands, type:
 $ ./generate-mount-ebs-volume-bootcmd /dev/xvdd /var/mqm wmq-data
 ```
 The first parameter is your device name, the second the mount point and the third the label.
-It will generate a bootcmd snippet, you can add to your user-data.
+It will generate a bootcmd snippet, you can add to your machine's cloud-config.
 ```
   bootcmd:
     - mkdir -p /var/mqm
